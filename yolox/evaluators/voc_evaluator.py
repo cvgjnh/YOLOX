@@ -2,6 +2,10 @@
 # -*- coding:utf-8 -*-
 # Copyright (c) Megvii, Inc. and its affiliates.
 
+import sys
+import tempfile
+import time
+from collections import ChainMap
 from loguru import logger
 from tqdm import tqdm
 
@@ -11,25 +15,13 @@ import torch
 
 from yolox.utils import gather, is_main_process, postprocess, synchronize, time_synchronized
 
-import sys
-import tempfile
-import time
-from collections import ChainMap
-
 
 class VOCEvaluator:
     """
     VOC AP Evaluation class.
     """
 
-    def __init__(
-        self,
-        dataloader,
-        img_size,
-        confthre,
-        nmsthre,
-        num_classes,
-    ):
+    def __init__(self, dataloader, img_size, confthre, nmsthre, num_classes):
         """
         Args:
             dataloader (Dataloader): evaluate dataloader.
@@ -47,13 +39,8 @@ class VOCEvaluator:
         self.num_images = len(dataloader.dataset)
 
     def evaluate(
-        self,
-        model,
-        distributed=False,
-        half=False,
-        trt_file=None,
-        decoder=None,
-        test_size=None,
+        self, model, distributed=False, half=False, trt_file=None,
+        decoder=None, test_size=None, return_outputs=False,
     ):
         """
         VOC average precision (AP) Evaluation. Iterate inference on the test dataset
@@ -80,7 +67,7 @@ class VOCEvaluator:
 
         inference_time = 0
         nms_time = 0
-        n_samples = len(self.dataloader) - 1
+        n_samples = max(len(self.dataloader) - 1, 1)
 
         if trt_file is not None:
             from torch2trt import TRTModule
@@ -92,13 +79,11 @@ class VOCEvaluator:
             model(x)
             model = model_trt
 
-        for cur_iter, (imgs, _, info_imgs, ids) in enumerate(
-            progress_bar(self.dataloader)
-        ):
+        for cur_iter, (imgs, _, info_imgs, ids) in enumerate(progress_bar(self.dataloader)):
             with torch.no_grad():
                 imgs = imgs.type(tensor_type)
 
-                # skip the the last iters since batchsize might be not enough for batch inference
+                # skip the last iters since batchsize might be not enough for batch inference
                 is_time_record = cur_iter < len(self.dataloader) - 1
                 if is_time_record:
                     start = time.time()
@@ -128,13 +113,13 @@ class VOCEvaluator:
 
         eval_results = self.evaluate_prediction(data_list, statistics)
         synchronize()
+        if return_outputs:
+            return eval_results, data_list
         return eval_results
 
     def convert_to_voc_format(self, outputs, info_imgs, ids):
         predictions = {}
-        for (output, img_h, img_w, img_id) in zip(
-            outputs, info_imgs[0], info_imgs[1], ids
-        ):
+        for output, img_h, img_w, img_id in zip(outputs, info_imgs[0], info_imgs[1], ids):
             if output is None:
                 predictions[int(img_id)] = (None, None, None)
                 continue
@@ -143,9 +128,7 @@ class VOCEvaluator:
             bboxes = output[:, 0:4]
 
             # preprocessing: resize
-            scale = min(
-                self.img_size[0] / float(img_h), self.img_size[1] / float(img_w)
-            )
+            scale = min(self.img_size[0] / float(img_h), self.img_size[1] / float(img_w))
             bboxes /= scale
 
             cls = output[:, 6]
@@ -176,7 +159,6 @@ class VOCEvaluator:
                 )
             ]
         )
-
         info = time_info + "\n"
 
         all_boxes = [
@@ -197,13 +179,9 @@ class VOCEvaluator:
                 c_dets = torch.cat((bboxes, scores.unsqueeze(1)), dim=1)
                 all_boxes[j][img_num] = c_dets[mask_c].numpy()
 
-            sys.stdout.write(
-                "im_eval: {:d}/{:d} \r".format(img_num + 1, self.num_images)
-            )
+            sys.stdout.write(f"im_eval: {img_num + 1}/{self.num_images} \r")
             sys.stdout.flush()
 
         with tempfile.TemporaryDirectory() as tempdir:
-            mAP50, mAP70 = self.dataloader.dataset.evaluate_detections(
-                all_boxes, tempdir
-            )
+            mAP50, mAP70 = self.dataloader.dataset.evaluate_detections(all_boxes, tempdir)
             return mAP50, mAP70, info
